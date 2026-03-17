@@ -1,0 +1,25 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Ansible sensitive data
+group_vars/*.yml
+host_vars/*.yml
+
+# Permitir apenas templates
+!group_vars/*.example
+!host_vars/*.example
+
+# Logs
+logs/
+
+# Backup configs
+*.cfg
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store

@@ -1,0 +1,36 @@
+---
+- name: "CENTRAIS | v200 via Netmiko(TELNET) com precheck, sanity e rollback"
+  hosts: central_routers
+  gather_facts: no
+  connection: local
+
+  vars_files:
+    - "{{ playbook_dir }}/../group_vars/central_routers.yml"
+
+  vars:
+    venv_python: "{{ playbook_dir }}/../.venv/bin/python"
+    logs_dir: "{{ playbook_dir }}/../logs"
+
+  tasks:
+    - name: "LOG | Alvo (inventory + IP)"
+      debug:
+        msg: "Alvo={{ inventory_hostname }} ip={{ ansible_host | default(inventory_hostname) }}"
+
+    - name: "Executar NETMIKO central_v200 (respeita --check)"
+      check_mode: false
+      ansible.builtin.command: >
+        {{ venv_python }} {{ playbook_dir }}/../scripts/netmiko_runner.py
+        --mode central_v200
+        --host {{ ansible_host | default(inventory_hostname) }}
+        --username {{ net_username }}
+        --password {{ net_password }}
+        --hostvars {{ playbook_dir }}/../host_vars/{{ inventory_hostname }}.yml
+        --logs-dir {{ logs_dir }}
+        {% if ansible_check_mode %} --dry-run {% endif %}
+      register: nm
+      changed_when: not ansible_check_mode
+      failed_when: nm.rc != 0
+
+    - name: "Resultado (JSON)"
+      debug:
+        var: nm.stdout

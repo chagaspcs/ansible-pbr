@@ -1,0 +1,10 @@
+---
+hostname: ROTEADOR_1
+
+pbr:
+  next_hop: 10.112.80.201
+  track_id: 6
+
+interfaces:
+  - GigabitEthernet0/0
+  - GigabitEthernet0/1

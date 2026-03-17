@@ -1,0 +1,69 @@
+---
+- name: "REMOTOS | Ajustar sbt via Netmiko(TELNET) com checagem N2, sanity, testes e rollback"
+  hosts: central_routers
+  gather_facts: no
+
+  vars_files:
+    - "{{ playbook_dir }}/../group_vars/central_routers.yml"
+
+  vars:
+    venv_python: "{{ playbook_dir }}/../.venv/bin/python"
+    runner: "{{ playbook_dir }}/../scripts/netmiko_runner.py"
+    logs_dir: "{{ playbook_dir }}/../logs"
+
+  tasks:
+    - name: "LOG | Alvo (inventory + IP)"
+      ansible.builtin.debug:
+        msg: "Alvo={{ inventory_hostname }} ip={{ ansible_host }}"
+
+    - name: "Executar NETMIKO remote_sites em check mode"
+      ansible.builtin.command:
+        argv:
+          - "{{ venv_python }}"
+          - "{{ runner }}"
+          - "--mode"
+          - "remote_sites"
+          - "--host"
+          - "{{ ansible_host }}"
+          - "--username"
+          - "{{ net_username }}"
+          - "--password"
+          - "{{ net_password }}"
+          - "--hostvars"
+          - "{{ playbook_dir }}/../host_vars/{{ inventory_hostname }}.yml"
+          - "--logs-dir"
+          - "{{ logs_dir }}"
+          - "--dry-run"
+      register: nm
+      changed_when: false
+      failed_when: nm.rc != 0
+      when: ansible_check_mode
+      check_mode: no
+
+    - name: "Executar NETMIKO remote_sites em modo normal"
+      ansible.builtin.command:
+        argv:
+          - "{{ venv_python }}"
+          - "{{ runner }}"
+          - "--mode"
+          - "remote_sites"
+          - "--host"
+          - "{{ ansible_host }}"
+          - "--username"
+          - "{{ net_username }}"
+          - "--password"
+          - "{{ net_password }}"
+          - "--hostvars"
+          - "{{ playbook_dir }}/../host_vars/{{ inventory_hostname }}.yml"
+          - "--logs-dir"
+          - "{{ logs_dir }}"
+      register: nm
+      changed_when: false
+      failed_when: nm.rc != 0
+      when: not ansible_check_mode
+      check_mode: no
+
+    - name: "Resultado (JSON)"
+      ansible.builtin.debug:
+        var: nm.stdout | from_json
+      when: nm is defined and nm.stdout is defined and nm.stdout | length > 0

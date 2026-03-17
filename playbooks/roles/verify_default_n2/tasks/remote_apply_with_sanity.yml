@@ -1,0 +1,320 @@
+# roles/verify_default_n2/tasks/remote_apply_with_sanity.yml
+#
+# Objetivo (ROTEADORES REMOTOS):
+# 1) Verificar default NSSA no OSPF 1 via:
+#       show ip ospf 1 database nssa-external 0.0.0.0
+#    e considerar válida se Advertising Router for 10.115.87.x ou 10.115.88.x
+# 2) Verificar se existe "ip policy route-map sbt" em Gi0/0 OU Gi0/0.2
+# 3) Se (1) e (2) forem verdade:
+#    - Fazer backup no flash
+#    - Reordenar SOMENTE as linhas "set ip next-hop verify-availability ..." dentro de:
+#         route-map sbt permit 10
+#      colocando PRIMEIRO o next-hop igual ao Advertising Router
+#    - Sanity check
+#    - Se sanity falhar: rollback (configure replace) e indicar onde falhou
+#
+# Pré-requisitos:
+# - conexão telnet já no prompt privilegiado (#)
+# - ansible_network_os=cisco.ios.ios
+#
+# Variáveis (podem ficar em defaults do role, mas já deixei aqui):
+# - remote_route_map: "sbt"
+# - remote_route_map_seq: 10
+# - remote_policy_interfaces: ["GigabitEthernet0/0", "GigabitEthernet0/0.2"]
+
+# ------------------------------------------------------------------------------
+# 0) Hostname (para log)
+# ------------------------------------------------------------------------------
+- name: "remote | Capturar hostname real"
+  ansible.netcommon.cli_command:
+    command: "show run | include ^hostname"
+  register: hostname_cmd
+  failed_when: false
+
+- name: "remote | Definir device_hostname"
+  ansible.builtin.set_fact:
+    device_hostname: "{{ hostname_cmd.stdout | regex_search('hostname\\s+(\\S+)', '\\1') | default(inventory_hostname) }}"
+
+- name: "remote | LOG início"
+  ansible.builtin.debug:
+    msg: "▶ Acessando roteador remoto: {{ device_hostname }} (inventory: {{ inventory_hostname }})"
+
+# ------------------------------------------------------------------------------
+# 1) Defaults locais (ajuste aqui se necessário)
+# ------------------------------------------------------------------------------
+- name: "remote | Definir defaults do remoto"
+  ansible.builtin.set_fact:
+    remote_route_map: "{{ remote_route_map | default('sbt') }}"
+    remote_route_map_seq: "{{ remote_route_map_seq | default(10) }}"
+    remote_policy_interfaces: "{{ remote_policy_interfaces | default(['GigabitEthernet0/0', 'GigabitEthernet0/0.2']) }}"
+
+# ------------------------------------------------------------------------------
+# 2) Condição #1: Default NSSA OSPF (Advertising Router 10.115.87.x/88.x)
+# ------------------------------------------------------------------------------
+- name: "remote | Checar default NSSA no OSPF 1"
+  ansible.netcommon.cli_command:
+    command: "show ip ospf 1 database nssa-external 0.0.0.0"
+  register: ospf_default_db
+  failed_when: false
+
+- name: "remote | Extrair Advertising Router"
+  ansible.builtin.set_fact:
+    adv_router: "{{ ospf_default_db.stdout | regex_search('Advertising Router:\\s*(\\S+)', '\\1') | default('') }}"
+
+- name: "remote | Validar Advertising Router (10.115.87.x ou 10.115.88.x)"
+  ansible.builtin.set_fact:
+    ospf_default_ok: "{{ adv_router is match('^10\\.115\\.(87|88)\\.[0-9]{1,3}$') }}"
+
+- name: "remote | LOG condição OSPF"
+  ansible.builtin.debug:
+    msg:
+      - "Advertising Router: {{ adv_router | default('N/A') }}"
+      - "ospf_default_ok: {{ ospf_default_ok }}"
+
+# ------------------------------------------------------------------------------
+# 3) Condição #2: Policy aplicada em Gi0/0 OU Gi0/0.2
+# ------------------------------------------------------------------------------
+- name: "remote | Ler config das interfaces de policy"
+  ansible.netcommon.cli_command:
+    command: "show run interface {{ item }}"
+  loop: "{{ remote_policy_interfaces }}"
+  register: if_cfgs
+  failed_when: false
+
+- name: "remote | Determinar se policy route-map sbt está aplicada em alguma interface"
+  ansible.builtin.set_fact:
+    policy_ok: >-
+      {{
+        (if_cfgs.results | map(attribute='stdout') | list | join('\n')) is search('ip policy route-map\\s+' ~ remote_route_map)
+      }}
+
+- name: "remote | LOG condição policy"
+  ansible.builtin.debug:
+    msg:
+      - "policy_ok: {{ policy_ok }}"
+      - "Interfaces checadas: {{ remote_policy_interfaces }}"
+
+# ------------------------------------------------------------------------------
+# 4) Se condições não baterem, não mexe
+# ------------------------------------------------------------------------------
+- name: "remote | Pular alteração (condições não atendidas)"
+  ansible.builtin.debug:
+    msg: "⏭️ Sem mudanças: ospf_default_ok={{ ospf_default_ok }}, policy_ok={{ policy_ok }}"
+  when: not (ospf_default_ok and policy_ok)
+
+# ------------------------------------------------------------------------------
+# 5) Se condições baterem: backup + reordenação + sanity + rollback
+# ------------------------------------------------------------------------------
+- block:
+
+    # -------------------
+    # 5.1 Backup (para rollback)
+    # -------------------
+    - name: "remote | Gerar nome do arquivo de rollback no flash"
+      ansible.builtin.set_fact:
+        rollback_file: "flash:ansible-prechange-{{ lookup('pipe','date +%Y%m%d-%H%M%S') }}.cfg"
+
+    - name: "remote | Backup running-config -> flash (pré-change)"
+      ansible.netcommon.cli_command:
+        command: "copy running-config {{ rollback_file }}"
+        prompt:
+          - "Destination filename.*"
+          - "\\[confirm\\]"
+          - "#"
+        answer:
+          - ""
+          - ""
+          - ""
+      register: backup_copy
+      failed_when: false
+
+    - name: "remote | LOG backup"
+      ansible.builtin.debug:
+        msg:
+          - "Backup pré-change salvo em {{ rollback_file }} no roteador {{ device_hostname }}"
+          - "Saída: {{ backup_copy.stdout }}"
+
+    # -------------------
+    # 5.2 Ler route-map atual e preparar reordenação
+    # -------------------
+    - name: "remote | Capturar seção do route-map (show run | section)"
+      ansible.netcommon.cli_command:
+        command: "show run | section ^route-map {{ remote_route_map }}\\b"
+      register: rm_section
+      failed_when: false
+
+    - name: "remote | Extrair linhas set verify-availability (route-map inteiro)"
+      ansible.builtin.set_fact:
+        rm_set_lines: >-
+          {{
+            (rm_section.stdout_lines | default([]))
+            | select('match', '^\\s*set ip next-hop verify-availability\\s+')
+            | list
+          }}
+
+    - name: "remote | Determinar linha set correspondente ao Advertising Router"
+      ansible.builtin.set_fact:
+        adv_set_line: >-
+          {{
+            (rm_set_lines
+              | select('search', 'verify-availability\\s+' ~ adv_router ~ '\\b')
+              | list
+              | first) | default('')
+          }}
+
+    - name: "remote | Validar que existe linha set com o Advertising Router"
+      ansible.builtin.assert:
+        that:
+          - rm_set_lines | length > 0
+          - adv_set_line | length > 0
+        fail_msg: >-
+          "Condições atendidas, mas não encontrei no route-map {{ remote_route_map }}
+           nenhuma linha 'set ip next-hop verify-availability' com o Advertising Router {{ adv_router }}.
+           Não é seguro reordenar."
+      register: rm_assert
+      failed_when: rm_assert is failed
+
+    - name: "remote | Montar nova ordem das linhas set (Advertising Router primeiro)"
+      ansible.builtin.set_fact:
+        new_set_lines: >-
+          {{
+            [adv_set_line] + (rm_set_lines | reject('equalto', adv_set_line) | list)
+          }}
+
+    - name: "remote | Montar comandos para limpar sets antigos e aplicar sets novos (somente sequence {{ remote_route_map_seq }})"
+      ansible.builtin.set_fact:
+        rm_no_set_cmds: "{{ rm_set_lines | map('regex_replace', '^\\s*', 'no ') | list }}"
+        rm_add_set_cmds: "{{ new_set_lines | map('regex_replace', '^\\s*', '') | list }}"
+
+    - name: "remote | LOG prévia reordenação"
+      ansible.builtin.debug:
+        msg:
+          - "Route-map: {{ remote_route_map }} seq {{ remote_route_map_seq }}"
+          - "Advertising Router: {{ adv_router }}"
+          - "Linha priorizada: {{ adv_set_line }}"
+          - "Nova ordem (sets): {{ new_set_lines }}"
+
+    # -------------------
+    # 5.3 Aplicar reordenação (somente sets) dentro do route-map sbt permit 10
+    # -------------------
+    - name: "remote | Aplicar reordenação dos sets no route-map"
+      ansible.netcommon.cli_config:
+        parents:
+          - "route-map {{ remote_route_map }} permit {{ remote_route_map_seq }}"
+        lines: "{{ rm_no_set_cmds + rm_add_set_cmds }}"
+      register: apply_cfg
+
+    # -------------------
+    # 5.4 SANITY CHECKS (acumular problemas)
+    # -------------------
+    - name: "remote | Inicializar sanity_issues"
+      ansible.builtin.set_fact:
+        sanity_issues: []
+
+    # Rechecar OSPF default (continua válido e no range)
+    - name: "remote | Sanity: rechecar default NSSA no OSPF 1"
+      ansible.netcommon.cli_command:
+        command: "show ip ospf 1 database nssa-external 0.0.0.0"
+      register: ospf_default_db_2
+      failed_when: false
+
+    - name: "remote | Sanity: validar Advertising Router após mudança"
+      ansible.builtin.set_fact:
+        adv_router_2: "{{ ospf_default_db_2.stdout | regex_search('Advertising Router:\\s*(\\S+)', '\\1') | default('') }}"
+        sanity_issues: >-
+          {{
+            sanity_issues + (
+              ([] if (adv_router_2 is match('^10\\.115\\.(87|88)\\.[0-9]{1,3}$'))
+               else [ {'check':'ospf default', 'where':'show ip ospf 1 database nssa-external 0.0.0.0', 'reason':'Advertising Router inválido após change', 'output': ospf_default_db_2.stdout } ])
+          }}
+
+    # Verificar policy ainda aplicada em Gi0/0 ou Gi0/0.2
+    - name: "remote | Sanity: show run interface (policy)"
+      ansible.netcommon.cli_command:
+        command: "show run interface {{ item }}"
+      loop: "{{ remote_policy_interfaces }}"
+      register: if_cfgs_2
+      failed_when: false
+
+    - name: "remote | Sanity: policy aplicada em alguma interface"
+      ansible.builtin.set_fact:
+        policy_ok_2: >-
+          {{
+            (if_cfgs_2.results | map(attribute='stdout') | list | join('\n')) is search('ip policy route-map\\s+' ~ remote_route_map)
+          }}
+        sanity_issues: >-
+          {{
+            sanity_issues + (
+              ([] if policy_ok_2 else [ {'check':'policy', 'where': remote_policy_interfaces, 'reason':'ip policy route-map sbt ausente', 'output': (if_cfgs_2.results | map(attribute='stdout') | list) } ])
+          }}
+
+    # Verificar route-map: primeira linha set deve ser do Advertising Router atual
+    - name: "remote | Sanity: show route-map {{ remote_route_map }}"
+      ansible.netcommon.cli_command:
+        command: "show route-map {{ remote_route_map }}"
+      register: rm_show
+      failed_when: false
+
+    - name: "remote | Sanity: validar que o PRIMEIRO set verify-availability usa o Advertising Router"
+      ansible.builtin.set_fact:
+        rm_show_set_lines: >-
+          {{
+            (rm_show.stdout_lines | default([]))
+            | select('match', '^\\s*set ip next-hop verify-availability\\s+')
+            | list
+          }}
+        first_set: "{{ (rm_show_set_lines | first) | default('') }}"
+        sanity_issues: >-
+          {{
+            sanity_issues + (
+              ([ {'check':'route-map', 'where': remote_route_map, 'reason':'não encontrei linhas set verify-availability', 'output': rm_show.stdout } ]
+               if (rm_show_set_lines | length == 0) else [])
+            ) + (
+              ([] if (first_set is search('verify-availability\\s+' ~ adv_router_2 ~ '\\b'))
+               else [ {'check':'route-map', 'where': remote_route_map, 'reason':'primeiro set não prioriza Advertising Router', 'expected': adv_router_2, 'got': first_set, 'output': rm_show.stdout } ])
+          }}
+
+    # -------------------
+    # 5.5 Se sanity falhar => rollback e indicar onde falhou
+    # -------------------
+    - name: "remote | LOG sanity issues (se houver)"
+      ansible.builtin.debug:
+        msg:
+          - "SANITY FAIL em {{ device_hostname }} — iniciando rollback"
+          - "{{ sanity_issues }}"
+      when: sanity_issues | length > 0
+
+    - block:
+        - name: "remote | ROLLBACK: configure replace {{ rollback_file }} force"
+          ansible.netcommon.cli_command:
+            command: "configure replace {{ rollback_file }} force"
+            prompt:
+              - "\\[yes/no\\]"
+              - "\\[confirm\\]"
+              - "#"
+            answer:
+              - "yes"
+              - ""
+              - ""
+          register: rollback_out
+          failed_when: false
+
+        - name: "remote | LOG rollback executado"
+          ansible.builtin.debug:
+            msg:
+              - "Rollback executado em {{ device_hostname }}"
+              - "Arquivo: {{ rollback_file }}"
+              - "Saída: {{ rollback_out.stdout }}"
+              - "Problema detectado em: {{ sanity_issues }}"
+
+        - name: "remote | Falhar o play após rollback (com causa)"
+          ansible.builtin.fail:
+            msg: "Sanity check falhou em {{ device_hostname }}. Rollback aplicado a partir de {{ rollback_file }}. Onde falhou: {{ sanity_issues }}"
+      when: sanity_issues | length > 0
+
+    - name: "remote | Sanity OK"
+      ansible.builtin.debug:
+        msg: "✅ Sanity OK em {{ device_hostname }}. Route-map {{ remote_route_map }} prioriza {{ adv_router_2 }} e policy permanece aplicada."
+      when: sanity_issues | length == 0
+
+  when: ospf_default_ok and policy_ok

@@ -1,0 +1,17 @@
+---
+- name: "CENTRAIS | Aplicar v200 com precheck, sanity e rollback"
+  hosts: central_routers
+  gather_facts: no
+  connection: ansible.netcommon.network_cli
+
+  vars:
+    ansible_network_cli_ssh_type: telnet
+    ansible_network_os: cisco.ios.ios
+    ansible_command_timeout: 120
+
+  tasks:
+
+    - name: "Executar role pbr_fix (v200)"
+      ansible.builtin.include_role:
+        name: pbr_fix
+        tasks_from: central_v200_apply_with_sanity.yml

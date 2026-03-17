@@ -1,0 +1,14 @@
+---
+- name: "REMOTOS | Priorizar Advertising Router no route-map sbt"
+  hosts: remote_routers
+  gather_facts: no
+  connection: ansible.netcommon.telnet
+
+  vars:
+    ansible_network_os: cisco.ios.ios
+    ansible_command_timeout: 120
+
+  tasks:
+    - include_role:
+        name: verify_default_n2
+        tasks_from: remote_apply_with_sanity.yml

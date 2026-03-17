@@ -1,0 +1,202 @@
+# roles/pbr_fix/tasks/central_v200_apply_with_sanity.yml
+# Pré-requisitos:
+# - conexão telnet (ansible.netcommon.telnet)
+# - você já cai no prompt privilegiado (#)
+# - v200_config_lines definido (idealmente em host_vars/R_CENTRAL_1.yml)
+# - v200_remote_sites, v200_source_ip, v200_ids, v200_route_map, v200_next_hop, v200_acl_tags, v200_policy_interfaces definidos
+
+# ------------------------------------------------------------------------------
+# 0) Hostname (para log legível)
+# ------------------------------------------------------------------------------
+- name: "central | Capturar hostname real"
+  ansible.netcommon.cli_command:
+    command: "show run | include ^hostname"
+  register: hostname_cmd
+  failed_when: false
+
+- name: "central | Definir device_hostname"
+  ansible.builtin.set_fact:
+    device_hostname: "{{ hostname_cmd.stdout | regex_search('hostname\\s+(\\S+)', '\\1') | default(inventory_hostname) }}"
+
+- name: "central | LOG início"
+  ansible.builtin.debug:
+    msg: "▶ Acessando roteador central: {{ device_hostname }} (inventory: {{ inventory_hostname }})"
+
+# ------------------------------------------------------------------------------
+# 1) Pré-check: ping < 400 ms (avg) para cada remote_site
+# ------------------------------------------------------------------------------
+- name: "central | Precheck ping (repeat {{ precheck_repeat | default(5) }})"
+  ansible.netcommon.cli_command:
+    command: "ping {{ item }} source {{ v200_source_ip }} repeat {{ precheck_repeat | default(5) }}"
+  loop: "{{ v200_remote_sites }}"
+  register: precheck_ping
+  failed_when: false
+
+- name: "central | Coletar falhas do precheck (avg RTT >= {{ precheck_rtt_ok_ms | default(400) }} ms)"
+  ansible.builtin.set_fact:
+    precheck_issues: "{{ (precheck_issues | default([])) + [ {'where': item.item, 'avg_ms': _avg, 'output': item.stdout } ] }}"
+  loop: "{{ precheck_ping.results }}"
+  vars:
+    _avg: "{{ (item.stdout | regex_search('round-trip min/avg/max\\s*=\\s*(\\d+)/(\\d+)/(\\d+)\\s*ms', '\\2') | default('999999')) | int }}"
+  when: _avg >= (precheck_rtt_ok_ms | default(400) | int)
+
+- name: "central | ABORTAR se precheck falhou (não aplica nada)"
+  ansible.builtin.fail:
+    msg: "Precheck ping falhou em {{ device_hostname }}. Problemas: {{ precheck_issues }}"
+  when: (precheck_issues | default([])) | length > 0
+
+# ------------------------------------------------------------------------------
+# 2) Backup no flash (para rollback)
+# ------------------------------------------------------------------------------
+- name: "central | Gerar nome do arquivo de rollback no flash"
+  ansible.builtin.set_fact:
+    rollback_file: "flash:ansible-prechange-{{ lookup('pipe','date +%Y%m%d-%H%M%S') }}.cfg"
+
+- name: "central | Backup running-config -> flash (pré-change)"
+  ansible.netcommon.cli_command:
+    command: "copy running-config {{ rollback_file }}"
+    # prompts mais comuns em copy
+    prompt:
+      - "Destination filename.*"
+      - "\\[confirm\\]"
+      - "#"
+    answer:
+      - ""    # ENTER para aceitar o nome sugerido
+      - ""    # ENTER no [confirm]
+      - ""    # no-op
+  register: backup_copy
+  failed_when: false
+
+- name: "central | LOG backup"
+  ansible.builtin.debug:
+    msg:
+      - "Backup pré-change salvo em {{ rollback_file }} no roteador {{ device_hostname }}"
+      - "Saída: {{ backup_copy.stdout }}"
+
+# ------------------------------------------------------------------------------
+# 3) Aplicar configuração (ACL/IP SLA/TRACK/ROUTE-MAP/POLICY)
+# ------------------------------------------------------------------------------
+- name: "central | Aplicar configuração v200 (CLI CONFIG)"
+  ansible.netcommon.cli_config:
+    lines: "{{ v200_config_lines }}"
+  register: apply_cfg
+
+# ------------------------------------------------------------------------------
+# 4) Sanity checks (e acumular onde falhou)
+# ------------------------------------------------------------------------------
+- name: "central | Inicializar sanity_issues"
+  ansible.builtin.set_fact:
+    sanity_issues: []
+
+# 4.1 show ip sla summary
+- name: "central | show ip sla summary"
+  ansible.netcommon.cli_command:
+    command: "show ip sla summary"
+  register: sla_summary
+  failed_when: false
+
+- name: "central | Sanity: validar IP SLA IDs presentes"
+  ansible.builtin.set_fact:
+    sanity_issues: "{{ sanity_issues + [ {'check':'show ip sla summary', 'where':'ip sla ' ~ item|string, 'reason':'ID não encontrado', 'output': sla_summary.stdout } ] }}"
+  loop: "{{ v200_ids }}"
+  when: not (sla_summary.stdout is search('^\\s*' ~ (item|string) ~ '\\b', multiline=True))
+
+# 4.2 show track brief
+- name: "central | show track brief"
+  ansible.netcommon.cli_command:
+    command: "show track brief"
+  register: track_brief
+  failed_when: false
+
+- name: "central | Sanity: validar track IDs presentes e não Down"
+  ansible.builtin.set_fact:
+    sanity_issues: "{{ sanity_issues + [ {'check':'show track brief', 'where':'track ' ~ item|string, 'reason':'ausente ou Down', 'output': track_brief.stdout } ] }}"
+  loop: "{{ v200_ids }}"
+  when: >
+    (
+      not (track_brief.stdout is search('^\\s*' ~ (item|string) ~ '\\b', multiline=True))
+      or (track_brief.stdout is search('^\\s*' ~ (item|string) ~ '\\b.*\\bDown\\b', multiline=True))
+    )
+
+# 4.3 show route-map
+- name: "central | show route-map {{ v200_route_map }}"
+  ansible.netcommon.cli_command:
+    command: "show route-map {{ v200_route_map }}"
+  register: rm_show
+  failed_when: false
+
+- name: "central | Sanity: route-map existe"
+  ansible.builtin.set_fact:
+    sanity_issues: "{{ sanity_issues + [ {'check':'show route-map', 'where': v200_route_map, 'reason':'route-map não encontrado', 'output': rm_show.stdout } ] }}"
+  when: rm_show.stdout is not search(v200_route_map)
+
+- name: "central | Sanity: match ip address contém todas as ACLs v200_*"
+  ansible.builtin.set_fact:
+    sanity_issues: "{{ sanity_issues + [ {'check':'show route-map', 'where': v200_route_map, 'reason':'match ip address incompleto (ACLs v200_*)', 'output': rm_show.stdout } ] }}"
+  when: >
+    not (rm_show.stdout is search('match ip address.*v200_aa.*v200_be.*v200_bv.*v200_cz.*v200_ei.*v200_ek.*v200_ep.*v200_fa'))
+
+- name: "central | Sanity: 8 linhas set verify-availability com track correto"
+  ansible.builtin.set_fact:
+    sanity_issues: "{{ sanity_issues + [ {'check':'show route-map', 'where': v200_route_map, 'reason':'linha set p/ track ' ~ item|string ~ ' não encontrada', 'output': rm_show.stdout } ] }}"
+  loop: "{{ v200_ids }}"
+  when: not (rm_show.stdout is search('set ip next-hop verify-availability\\s+' ~ v200_next_hop ~ '\\s+1\\s+track\\s+' ~ (item|string)))
+
+# 4.4 policy aplicada nas interfaces
+- name: "central | show run interface (policy)"
+  ansible.netcommon.cli_command:
+    command: "show run interface {{ item }}"
+  loop: "{{ v200_policy_interfaces }}"
+  register: if_runs
+  failed_when: false
+
+- name: "central | Sanity: ip policy route-map aplicado nas interfaces"
+  ansible.builtin.set_fact:
+    sanity_issues: "{{ sanity_issues + [ {'check':'show run interface', 'where': item.item, 'reason':'ip policy route-map não aplicado', 'output': item.stdout } ] }}"
+  loop: "{{ if_runs.results }}"
+  when: ("ip policy route-map " ~ v200_route_map) not in (item.stdout | default(''))
+
+# ------------------------------------------------------------------------------
+# 5) Se sanity falhar => rollback e apontar onde falhou
+# ------------------------------------------------------------------------------
+- name: "central | LOG sanity issues (se houver)"
+  ansible.builtin.debug:
+    msg:
+      - "SANITY FAIL em {{ device_hostname }} — iniciando rollback"
+      - "{{ sanity_issues }}"
+  when: sanity_issues | length > 0
+
+- block:
+    - name: "central | ROLLBACK: configure replace {{ rollback_file }} force"
+      ansible.netcommon.cli_command:
+        command: "configure replace {{ rollback_file }} force"
+        # prompts típicos do configure replace
+        prompt:
+          - "\\[yes/no\\]"
+          - "\\[confirm\\]"
+          - "#"
+        answer:
+          - "yes"
+          - ""
+          - ""
+      register: rollback_out
+      failed_when: false
+
+    - name: "central | LOG rollback executado"
+      ansible.builtin.debug:
+        msg:
+          - "Rollback executado em {{ device_hostname }}"
+          - "Arquivo: {{ rollback_file }}"
+          - "Saída: {{ rollback_out.stdout }}"
+          - "Problema detectado em: {{ sanity_issues }}"
+
+    - name: "central | Falhar o play após rollback (com causa)"
+      ansible.builtin.fail:
+        msg: "Sanity check falhou em {{ device_hostname }}. Rollback aplicado a partir de {{ rollback_file }}. Onde falhou: {{ sanity_issues }}"
+
+  when: sanity_issues | length > 0
+
+- name: "central | Sanity OK"
+  ansible.builtin.debug:
+    msg: "✅ Sanity OK em {{ device_hostname }}. Nenhum rollback necessário."
+  when: sanity_issues | length == 0
