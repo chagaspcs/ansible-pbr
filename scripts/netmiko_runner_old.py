@@ -215,23 +215,18 @@ def _connect_ios_telnet(
     password: str,
     timeout: int = 30,
     session_log: Optional[Path] = None,
-    retries: int = 3,
+    retries: int = 4,
 ) -> ConnectHandler:
-
     base_device: Dict[str, Any] = {
-        "device_type": "cisco_ios_telnet",
+        "device_type": "generic_telnet",
         "host": host,
         "username": username,
         "password": password,
-
-        # timeouts: bump for slow links
         "timeout": max(timeout, 60),
         "banner_timeout": max(timeout, 60),
         "auth_timeout": max(timeout, 60),
         "conn_timeout": max(timeout, 60),
-
-        # slow down IO handling
-        "global_delay_factor": 3,
+        "global_delay_factor": 2,
         "fast_cli": False,
     }
 
@@ -244,31 +239,132 @@ def _connect_ios_telnet(
     for attempt in range(1, retries + 1):
         dev = dict(base_device)
 
-        # backoff progressivo
         if attempt == 2:
-            dev["global_delay_factor"] = 5
+            dev["global_delay_factor"] = 4
             dev["timeout"] = dev["banner_timeout"] = dev["auth_timeout"] = dev["conn_timeout"] = 90
         elif attempt >= 3:
-            dev["global_delay_factor"] = 8
+            dev["global_delay_factor"] = 6
             dev["timeout"] = dev["banner_timeout"] = dev["auth_timeout"] = dev["conn_timeout"] = 120
 
+        conn = None
         try:
-            # pequeno "settle" antes do connect (ajuda em termservers lentos)
-            time.sleep(0.6 if attempt == 1 else 1.2)
-            return ConnectHandler(**dev)
+            conn = ConnectHandler(**dev)
 
-        except (EOFError, NetmikoTimeoutException, NetmikoAuthenticationException) as e:
+            output = ""
+            sent_user = False
+            sent_pass = False
+            got_prompt = False
+
+            # 1) dá tempo para o banner aparecer sozinho
+            time.sleep(2.0)
+
+            for _ in range(100):
+                try:
+                    chunk = conn.read_channel()
+                except EOFError as e:
+                    raise RuntimeError(f"EOF during login banner phase on {host}") from e
+
+                if chunk:
+                    output += chunk
+
+                    if (not sent_user) and re.search(r"(Username:|login:)", output, re.I):
+                        conn.write_channel(username + "\r\n")
+                        sent_user = True
+                        output = ""
+                        time.sleep(1.2)
+                        continue
+
+                    if sent_user and (not sent_pass) and re.search(r"Password:", output, re.I):
+                        conn.write_channel(password + "\r\n")
+                        sent_pass = True
+                        output = ""
+                        time.sleep(1.2)
+                        continue
+
+                    if re.search(r"[>#]\s*$", output, re.M):
+                        got_prompt = True
+                        break
+
+                    if re.search(r"Password incorrect", output, re.I):
+                        raise NetmikoAuthenticationException(f"Login failed: {host}")
+
+                    if re.search(r"Entering password change dialog|Old password:", output, re.I):
+                        raise NetmikoAuthenticationException(
+                            f"Login failed: {host} (entered password change dialog)"
+                        )
+                else:
+                    # 2) só cutuca se nada apareceu
+                    conn.write_channel("\r\n")
+
+                time.sleep(0.7)
+
+            if not got_prompt:
+                raise NetmikoTimeoutException(
+                    f"Prompt not detected after login on {host}. Last output={output[-300:]!r}"
+                )
+
+            # sobe para enable se necessário
+            prompt_line = output.strip().splitlines()[-1] if output.strip() else ""
+            if prompt_line.endswith(">"):
+                conn.write_channel("enable\r\n")
+                time.sleep(1.0)
+
+                buf = ""
+                for _ in range(20):
+                    chunk = conn.read_channel()
+                    if chunk:
+                        buf += chunk
+
+                        if re.search(r"Password:", buf, re.I):
+                            conn.write_channel(password + "\r\n")
+                            buf = ""
+                            time.sleep(1.0)
+                            continue
+
+                        if re.search(r"#\s*$", buf, re.M):
+                            break
+
+                    time.sleep(0.5)
+
+            # terminal length só depois da sessão estável
+            conn.write_channel("terminal length 0\r\n")
+            time.sleep(1.0)
+            _ = conn.read_channel()
+
+            # probe final
+            conn.write_channel("\r\n")
+            time.sleep(1.0)
+            probe = conn.read_channel()
+
+            if not re.search(r"[#>]\s*$", probe, re.M):
+                raise NetmikoTimeoutException(
+                    f"Prompt not stable after terminal length 0 on {host}. probe={probe[-200:]!r}"
+                )
+
+            return conn
+
+        except (EOFError, BrokenPipeError, RuntimeError, NetmikoTimeoutException, NetmikoAuthenticationException) as e:
             last_exc = e
-            # espera antes de tentar de novo
-            time.sleep(1.0 + attempt * 1.0)
+            try:
+                if conn:
+                    conn.disconnect()
+            except Exception:
+                pass
+            time.sleep(2.0 + attempt)
             continue
 
         except Exception as e:
-            # erro não típico -> não fica insistindo
             last_exc = e
+            try:
+                if conn:
+                    conn.disconnect()
+            except Exception:
+                pass
             break
 
     raise RuntimeError(f"TELNET connect failed to {host}: {last_exc}")
+
+
 
 
 
@@ -283,16 +379,77 @@ def _safe_disconnect(conn: Optional[ConnectHandler]) -> None:
         pass
 
 
-def _send_exec(conn: ConnectHandler, cmd: str, expect: str = r"[#>]", delay: float = 0.0) -> str:
-    out = conn.send_command(cmd, expect_string=expect, strip_prompt=False, strip_command=False)
+def _send_exec(
+    conn: ConnectHandler,
+    cmd: str,
+    expect: str = r"[#>]",
+    delay: float = 0.0,
+    read_timeout: int = 90,
+) -> str:
+    """
+    Executa comando com tolerância a sessão lenta.
+    Mas se a sessão caiu (EOF/BrokenPipe), NÃO tenta fallback na mesma conexão.
+    """
+    try:
+        out = conn.send_command(
+            cmd,
+            expect_string=expect,
+            strip_prompt=False,
+            strip_command=False,
+            read_timeout=read_timeout,
+        )
+    except (EOFError, BrokenPipeError):
+        raise
+    except Exception:
+        out = conn.send_command_timing(
+            cmd,
+            strip_prompt=False,
+            strip_command=False,
+        )
+        time.sleep(1.0)
+        try:
+            out += conn.send_command_timing(
+                "",
+                strip_prompt=False,
+                strip_command=False,
+            )
+        except Exception:
+            pass
+
     if delay:
         time.sleep(delay)
+
     return out
 
-
+"""
 def _send_cfg(conn: ConnectHandler, cmds: List[str]) -> str:
     # send_config_set already enters config mode and exits
     return conn.send_config_set(cmds)
+"""
+def _send_cfg(conn: ConnectHandler, cmds: List[str]) -> str:
+    """
+    Aplica configuração entrando explicitamente em configure terminal.
+    Necessário porque estamos usando generic_telnet/login manual.
+    """
+    output = ""
+
+    # entra em config mode
+    conn.write_channel("configure terminal\r\n")
+    time.sleep(1.0)
+    output += conn.read_channel()
+
+    # envia comandos um a um
+    for cmd in cmds:
+        conn.write_channel(cmd + "\r\n")
+        time.sleep(0.6)
+        output += conn.read_channel()
+
+    # sai para exec mode
+    conn.write_channel("end\r\n")
+    time.sleep(1.0)
+    output += conn.read_channel()
+
+    return output
 
 
 def _copy_run_to_flash(conn: ConnectHandler, flash_filename: str) -> str:
@@ -334,7 +491,7 @@ def _parse_ping(out: str) -> Tuple[bool, Optional[float]]:
 
 def _ping(conn: ConnectHandler, dst_ip: str, repeat: int = 5) -> Tuple[bool, Optional[float], str]:
     cmd = f"ping {dst_ip} repeat {repeat}"
-    out = _send_exec(conn, cmd, expect=r"[#>]", delay=0.0)
+    out = _send_exec(conn, cmd, expect=r"[#>]", delay=0.0, read_timeout=120)
     ok, avg = _parse_ping(out)
     return ok, avg, out
 

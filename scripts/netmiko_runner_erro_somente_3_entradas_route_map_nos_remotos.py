@@ -215,18 +215,8 @@ def _connect_ios_telnet(
     password: str,
     timeout: int = 30,
     session_log: Optional[Path] = None,
-    retries: int = 3,
+    retries: int = 4,
 ) -> ConnectHandler:
-    """
-    TELNET robusto sem session_preparation automático do cisco_ios_telnet.
-
-    Estratégia:
-    - usa generic_telnet
-    - espera Username:/Password:
-    - só considera conectado quando aparece prompt > ou #
-    - só então envia 'terminal length 0'
-    """
-
     base_device: Dict[str, Any] = {
         "device_type": "generic_telnet",
         "host": host,
@@ -260,27 +250,35 @@ def _connect_ios_telnet(
         try:
             conn = ConnectHandler(**dev)
 
-            # -------------------------
-            # login manual
-            # -------------------------
             output = ""
+            sent_user = False
+            sent_pass = False
             got_prompt = False
 
-            for _ in range(60):
-                chunk = conn.read_channel()
+            # 1) dá tempo para o banner aparecer sozinho
+            time.sleep(2.0)
+
+            for _ in range(100):
+                try:
+                    chunk = conn.read_channel()
+                except EOFError as e:
+                    raise RuntimeError(f"EOF during login banner phase on {host}") from e
+
                 if chunk:
                     output += chunk
 
-                    if re.search(r"Username:|login:", output, re.I):
-                        conn.write_channel(username + "\n")
+                    if (not sent_user) and re.search(r"(Username:|login:)", output, re.I):
+                        conn.write_channel(username + "\r\n")
+                        sent_user = True
                         output = ""
-                        time.sleep(1.0)
+                        time.sleep(1.2)
                         continue
 
-                    if re.search(r"Password:", output, re.I):
-                        conn.write_channel(password + "\n")
+                    if sent_user and (not sent_pass) and re.search(r"Password:", output, re.I):
+                        conn.write_channel(password + "\r\n")
+                        sent_pass = True
                         output = ""
-                        time.sleep(1.0)
+                        time.sleep(1.2)
                         continue
 
                     if re.search(r"[>#]\s*$", output, re.M):
@@ -294,57 +292,65 @@ def _connect_ios_telnet(
                         raise NetmikoAuthenticationException(
                             f"Login failed: {host} (entered password change dialog)"
                         )
+                else:
+                    # 2) só cutuca se nada apareceu
+                    conn.write_channel("\r\n")
 
-                time.sleep(0.5)
+                time.sleep(0.7)
 
             if not got_prompt:
-                raise NetmikoTimeoutException(f"Prompt not detected after login on {host}")
+                raise NetmikoTimeoutException(
+                    f"Prompt not detected after login on {host}. Last output={output[-300:]!r}"
+                )
 
-            # -------------------------
-            # estabiliza o prompt
-            # -------------------------
-            time.sleep(1.0)
-
-            # se estiver em ">", sobe para enable se necessário
-            prompt = conn.find_prompt()
-            if prompt.strip().endswith(">"):
-                conn.write_channel("enable\n")
+            # sobe para enable se necessário
+            prompt_line = output.strip().splitlines()[-1] if output.strip() else ""
+            if prompt_line.endswith(">"):
+                conn.write_channel("enable\r\n")
                 time.sleep(1.0)
 
-                out2 = ""
+                buf = ""
                 for _ in range(20):
                     chunk = conn.read_channel()
                     if chunk:
-                        out2 += chunk
-                        if re.search(r"Password:", out2, re.I):
-                            conn.write_channel(password + "\n")
-                            out2 = ""
+                        buf += chunk
+
+                        if re.search(r"Password:", buf, re.I):
+                            conn.write_channel(password + "\r\n")
+                            buf = ""
                             time.sleep(1.0)
                             continue
-                        if re.search(r"#\s*$", out2, re.M):
+
+                        if re.search(r"#\s*$", buf, re.M):
                             break
+
                     time.sleep(0.5)
 
-            # -------------------------
-            # só agora ajusta terminal
-            # -------------------------
-            try:
-                conn.write_channel("terminal length 0\n")
-                time.sleep(1.0)
-                _ = conn.read_channel()
-            except Exception:
-                pass
+            # terminal length só depois da sessão estável
+            conn.write_channel("terminal length 0\r\n")
+            time.sleep(1.0)
+            _ = conn.read_channel()
+
+            # probe final
+            conn.write_channel("\r\n")
+            time.sleep(1.0)
+            probe = conn.read_channel()
+
+            if not re.search(r"[#>]\s*$", probe, re.M):
+                raise NetmikoTimeoutException(
+                    f"Prompt not stable after terminal length 0 on {host}. probe={probe[-200:]!r}"
+                )
 
             return conn
 
-        except (EOFError, NetmikoTimeoutException, NetmikoAuthenticationException) as e:
+        except (EOFError, BrokenPipeError, RuntimeError, NetmikoTimeoutException, NetmikoAuthenticationException) as e:
             last_exc = e
             try:
                 if conn:
                     conn.disconnect()
             except Exception:
                 pass
-            time.sleep(1.0 + attempt)
+            time.sleep(2.0 + attempt)
             continue
 
         except Exception as e:
@@ -361,6 +367,7 @@ def _connect_ios_telnet(
 
 
 
+
 ### código correto ###
 
 
@@ -372,16 +379,77 @@ def _safe_disconnect(conn: Optional[ConnectHandler]) -> None:
         pass
 
 
-def _send_exec(conn: ConnectHandler, cmd: str, expect: str = r"[#>]", delay: float = 0.0) -> str:
-    out = conn.send_command(cmd, expect_string=expect, strip_prompt=False, strip_command=False)
+def _send_exec(
+    conn: ConnectHandler,
+    cmd: str,
+    expect: str = r"[#>]",
+    delay: float = 0.0,
+    read_timeout: int = 90,
+) -> str:
+    """
+    Executa comando com tolerância a sessão lenta.
+    Mas se a sessão caiu (EOF/BrokenPipe), NÃO tenta fallback na mesma conexão.
+    """
+    try:
+        out = conn.send_command(
+            cmd,
+            expect_string=expect,
+            strip_prompt=False,
+            strip_command=False,
+            read_timeout=read_timeout,
+        )
+    except (EOFError, BrokenPipeError):
+        raise
+    except Exception:
+        out = conn.send_command_timing(
+            cmd,
+            strip_prompt=False,
+            strip_command=False,
+        )
+        time.sleep(1.0)
+        try:
+            out += conn.send_command_timing(
+                "",
+                strip_prompt=False,
+                strip_command=False,
+            )
+        except Exception:
+            pass
+
     if delay:
         time.sleep(delay)
+
     return out
 
-
+"""
 def _send_cfg(conn: ConnectHandler, cmds: List[str]) -> str:
     # send_config_set already enters config mode and exits
     return conn.send_config_set(cmds)
+"""
+def _send_cfg(conn: ConnectHandler, cmds: List[str]) -> str:
+    """
+    Aplica configuração entrando explicitamente em configure terminal.
+    Necessário porque estamos usando generic_telnet/login manual.
+    """
+    output = ""
+
+    # entra em config mode
+    conn.write_channel("configure terminal\r\n")
+    time.sleep(1.0)
+    output += conn.read_channel()
+
+    # envia comandos um a um
+    for cmd in cmds:
+        conn.write_channel(cmd + "\r\n")
+        time.sleep(0.6)
+        output += conn.read_channel()
+
+    # sai para exec mode
+    conn.write_channel("end\r\n")
+    time.sleep(1.0)
+    output += conn.read_channel()
+
+    return output
 
 
 def _copy_run_to_flash(conn: ConnectHandler, flash_filename: str) -> str:
@@ -423,7 +491,7 @@ def _parse_ping(out: str) -> Tuple[bool, Optional[float]]:
 
 def _ping(conn: ConnectHandler, dst_ip: str, repeat: int = 5) -> Tuple[bool, Optional[float], str]:
     cmd = f"ping {dst_ip} repeat {repeat}"
-    out = _send_exec(conn, cmd, expect=r"[#>]", delay=0.0)
+    out = _send_exec(conn, cmd, expect=r"[#>]", delay=0.0, read_timeout=120)
     ok, avg = _parse_ping(out)
     return ok, avg, out
 
@@ -1242,6 +1310,341 @@ def run_remote_sites(
         sites_failed=sites_failed,
     )
 
+# ---------------------------------
+# ROLLBACK
+# ---------------------------------
+
+def run_rollback(
+    *,
+    hv: Dict[str, Any],
+    gv: Dict[str, Any],
+    logs_dir: Path,
+    dry_run: bool,
+    username: str,
+    password: str,
+    host: str,
+) -> Result:
+    """
+    Rollback integral:
+      - centrais: remove policy/interface, route-map, ACLs, track, ip sla
+      - remotos: reordena route-map sbt para:
+            prioridade 2 -> 1
+            prioridade 3 -> 2
+            prioridade 1 (10.115.87.x/10.115.88.x) -> 3
+    """
+
+    def _read_remote_sbt_sets(
+        conn: ConnectHandler,
+        route_map_name: str = "sbt",
+        seq: int = 10,
+    ) -> List[Dict[str, Any]]:
+        out_rm = _send_exec(
+            conn,
+            f"show run | section ^route-map {route_map_name}\\b",
+            read_timeout=90,
+        )
+
+        lines = out_rm.splitlines()
+        in_target_seq = False
+        set_lines: List[Dict[str, Any]] = []
+
+        for line in lines:
+            stripped = line.strip()
+
+            if re.match(rf"^route-map {re.escape(route_map_name)} permit {seq}$", stripped):
+                in_target_seq = True
+                continue
+
+            if in_target_seq:
+                if stripped.startswith("route-map "):
+                    in_target_seq = False
+                    continue
+
+                m = re.search(
+                    r"^set ip next-hop verify-availability\s+"
+                    r"(\d+\.\d+\.\d+\.\d+)\s+"
+                    r"(\d+)\s+track\s+(\d+)$",
+                    stripped,
+                )
+                if m:
+                    set_lines.append(
+                        {
+                            "next_hop": m.group(1),
+                            "priority": int(m.group(2)),
+                            "track": int(m.group(3)),
+                            "raw": stripped,
+                        }
+                    )
+
+        return set_lines
+
+    def _build_remote_rollback_sbt_commands(
+        current_sets: List[Dict[str, Any]],
+        route_map_name: str = "sbt",
+        seq: int = 10,
+    ) -> List[str]:
+        """
+        Regra do rollback remoto:
+          - a entrada atualmente em prioridade 1 (10.115.87.x ou 10.115.88.x) vai para prioridade 3
+          - a antiga prioridade 2 vira 1
+          - a antiga prioridade 3 vira 2
+        """
+
+        if len(current_sets) != 3:
+            raise RuntimeError(
+                f"Expected exactly 3 set lines in route-map {route_map_name} permit {seq}, got {len(current_sets)}"
+            )
+
+        ordered = sorted(current_sets, key=lambda x: x["priority"])
+
+        p1 = ordered[0]
+        p2 = ordered[1]
+        p3 = ordered[2]
+
+        if not (
+            p1["next_hop"].startswith("10.115.87.")
+            or p1["next_hop"].startswith("10.115.88.")
+        ):
+            raise RuntimeError(
+                f"Expected priority 1 to be 10.115.87.x/10.115.88.x, got {p1['next_hop']}"
+            )
+
+        new_order = [p2, p3, p1]
+
+        cmds: List[str] = [f"route-map {route_map_name} permit {seq}"]
+
+        for item in ordered:
+            cmds.append(f" no {item['raw']}")
+
+        for idx, item in enumerate(new_order, start=1):
+            cmds.append(
+                f" set ip next-hop verify-availability {item['next_hop']} {idx} track {item['track']}"
+            )
+
+        cmds.append("exit")
+        return cmds
+
+    route_map_name = hv.get("route_map_name", gv.get("route_map_name", "v200_to_s2s"))
+    apply_interfaces = hv.get("apply_interfaces", gv.get("apply_interfaces", ["GigabitEthernet0/0", "GigabitEthernet0/1"]))
+
+    remote_route_map = gv.get("remote_route_map", "sbt")
+    remote_route_map_seq = int(gv.get("remote_route_map_seq", 10))
+
+    blocks: List[Dict[str, Any]] = hv.get("blocks") or []
+    if not blocks:
+        return Result(
+            ok=False,
+            hostname="UNKNOWN",
+            where_failed="hostvars_schema",
+            details="Missing 'blocks' in hostvars",
+            sites_total=0,
+            sites_changed=0,
+            sites_skipped=0,
+            sites_failed=0,
+        )
+
+    hostname_last = "UNKNOWN"
+    summary: Dict[str, Any] = {"blocks": []}
+
+    sites_total = 0
+    sites_changed = 0
+    sites_skipped = 0
+    sites_failed = 0
+
+    # ---------------------------------
+    # 1) ROLLBACK NOS CENTRAIS
+    # ---------------------------------
+    central_base = _mklogbase(logs_dir, label=f"rollback_central_{hv.get('inventory_hostname', host)}", ip=host)
+    conn_central = None
+
+    try:
+        conn_central = _connect_ios_telnet(
+            host,
+            username,
+            password,
+            timeout=30,
+            session_log=central_base.with_suffix(".session.log"),
+        )
+        hostname_last = _parse_hostname_from_prompt(conn_central.find_prompt())
+
+        central_cmds: List[str] = []
+        all_acl_tags: List[str] = []
+        all_sla_ids: List[int] = []
+        all_track_ids: List[int] = []
+
+        for block in blocks:
+            # remove policy das interfaces
+            for intf in apply_interfaces:
+                central_cmds += [
+                    f"interface {intf}",
+                    f" no ip policy route-map {route_map_name}",
+                    "exit",
+                ]
+
+            # ACL tags
+            acl_tags = block.get("acl_tags") or []
+            all_acl_tags.extend(acl_tags)
+
+            # sla/track ids derivados dos arubas
+            for aruba_ip in block.get("aruba_remoto", []):
+                sid = int(str(aruba_ip).split(".")[-1])
+                all_sla_ids.append(sid)
+                all_track_ids.append(sid)
+
+        # route-map (uma vez só)
+        central_cmds.append(f"no route-map {route_map_name}")
+
+        # ACLs
+        for tag in sorted(set(all_acl_tags)):
+            central_cmds.append(f"no ip access-list extended {tag}")
+
+        # tracks
+        for tid in sorted(set(all_track_ids)):
+            central_cmds.append(f"no track {tid}")
+
+        # sla schedule + sla
+        for sid in sorted(set(all_sla_ids)):
+            central_cmds.append(f"no ip sla schedule {sid}")
+            central_cmds.append(f"no ip sla {sid}")
+
+        _write_text(central_base.with_suffix(".planned.cfg"), "\n".join(central_cmds) + "\n")
+
+        if not dry_run and central_cmds:
+            out_apply = _send_cfg(conn_central, central_cmds)
+            _write_text(central_base.with_suffix(".apply.txt"), out_apply)
+
+    except Exception as e:
+        _write_text(central_base.with_suffix(".error.txt"), str(e))
+        return Result(
+            ok=False,
+            hostname=hostname_last,
+            where_failed="central_rollback",
+            details=str(e),
+            sites_total=sites_total,
+            sites_changed=sites_changed,
+            sites_skipped=sites_skipped,
+            sites_failed=sites_failed,
+        )
+    finally:
+        _safe_disconnect(conn_central)
+
+    # ---------------------------------
+    # 2) ROLLBACK NOS REMOTOS
+    # ---------------------------------
+    for b_idx, block in enumerate(blocks):
+        block_name = block.get("name", f"block{b_idx+1}")
+        block_report = {"name": block_name, "sites": []}
+
+        rr_list = block.get("roteador_remoto", [])
+        for i, rr_ip in enumerate(rr_list):
+            sites_total += 1
+            site_report: Dict[str, Any] = {
+                "roteador_remoto": rr_ip,
+                "sw_local": block.get("sw_local"),
+                "sw_remoto": (block.get("sw_remoto") or [None] * len(rr_list))[i],
+                "mux_local": (block.get("mux_local") or [None] * len(rr_list))[i],
+                "mux_remoto": (block.get("mux_remoto") or [None] * len(rr_list))[i],
+            }
+
+            base = _mklogbase(logs_dir, label=f"rollback_remote_{block_name}_{rr_ip}", ip=rr_ip)
+            conn_r = None
+
+            try:
+                conn_r = _connect_ios_telnet(
+                    rr_ip,
+                    username,
+                    password,
+                    timeout=30,
+                    session_log=base.with_suffix(".session.log"),
+                )
+                hostname_last = _parse_hostname_from_prompt(conn_r.find_prompt())
+                site_report["hostname"] = hostname_last
+
+                current_sets = _read_remote_sbt_sets(conn_r, route_map_name=remote_route_map, seq=remote_route_map_seq)
+                site_report["set_before"] = [x["raw"] for x in sorted(current_sets, key=lambda z: z["priority"])]
+
+                cmds_r = _build_remote_rollback_sbt_commands(
+                    current_sets,
+                    route_map_name=remote_route_map,
+                    seq=remote_route_map_seq,
+                )
+
+                site_report["planned_commands"] = cmds_r
+                _write_text(base.with_suffix(".planned.cfg"), "\n".join(cmds_r) + "\n")
+
+                if dry_run:
+                    site_report["status"] = "dry_run_change_planned"
+                    block_report["sites"].append(site_report)
+                    _write_json(base.with_suffix(".result.json"), site_report)
+                    sites_changed += 1
+                    continue
+
+                out_apply = _send_cfg(conn_r, cmds_r)
+                _write_text(base.with_suffix(".apply.txt"), out_apply)
+
+                # sanity do remoto
+                out_after = _send_exec(
+                    conn_r,
+                    f"show run | section ^route-map {remote_route_map}\\b",
+                    read_timeout=90,
+                )
+                _write_text(base.with_suffix(".after.txt"), out_after)
+
+                after_sets = _read_remote_sbt_sets(conn_r, route_map_name=remote_route_map, seq=remote_route_map_seq)
+                ordered_after = sorted(after_sets, key=lambda x: x["priority"])
+
+                if len(ordered_after) != 3:
+                    raise RuntimeError(f"Expected 3 set lines after rollback, got {len(ordered_after)}")
+
+                if ordered_after[0]["priority"] != 1 or ordered_after[1]["priority"] != 2 or ordered_after[2]["priority"] != 3:
+                    raise RuntimeError("Priorities after rollback are not 1/2/3")
+
+                if not (
+                    ordered_after[2]["next_hop"].startswith("10.115.87.")
+                    or ordered_after[2]["next_hop"].startswith("10.115.88.")
+                ):
+                    raise RuntimeError(
+                        f"Expected priority 3 to be 10.115.87.x/10.115.88.x, got {ordered_after[2]['next_hop']}"
+                    )
+
+                site_report["set_after"] = [x["raw"] for x in ordered_after]
+                site_report["status"] = "ok"
+
+                block_report["sites"].append(site_report)
+                _write_json(base.with_suffix(".result.json"), site_report)
+                sites_changed += 1
+
+            except Exception as e:
+                sites_failed += 1
+                site_report["status"] = "failed"
+                site_report["error"] = str(e)
+                block_report["sites"].append(site_report)
+                _write_json(base.with_suffix(".result.json"), site_report)
+            finally:
+                _safe_disconnect(conn_r)
+
+        summary["blocks"].append(block_report)
+
+    _write_json(logs_dir / f"rollback_summary_{_now_tag()}.json", summary)
+
+    return Result(
+        ok=(sites_failed == 0),
+        hostname=hostname_last,
+        where_failed=None if sites_failed == 0 else "rollback_remote_or_central",
+        details=None if sites_failed == 0 else "One or more rollback operations failed",
+        rollback_attempted=False,
+        rollback_ok=None,
+        planned_commands=None,
+        sites_total=sites_total,
+        sites_changed=sites_changed,
+        sites_skipped=sites_skipped,
+        sites_failed=sites_failed,
+    )
+
+
+
+
+
 # ----------------------------
 # Loading vars
 # ----------------------------
@@ -1260,7 +1663,7 @@ def _load_yaml_if_exists(path: Path) -> Dict[str, Any]:
 # ----------------------------
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", required=True, choices=["central_v200", "remote_sites"])
+    ap.add_argument("--mode", required=True, choices=["central_v200", "remote_sites", "rollback"])
     ap.add_argument("--host", required=True, help="Router management IP (ansible_host)")
     ap.add_argument("--username", required=True)
     ap.add_argument("--password", required=True)
@@ -1302,6 +1705,17 @@ def main() -> int:
             username=args.username,
             password=args.password,
         )
+    elif args.mode == "rollback":
+        res = run_rollback(
+            hv=hv,
+            gv=gv,
+            logs_dir=logs_dir,
+            dry_run=args.dry_run,
+            username=args.username,
+            password=args.password,
+            host=args.host,
+        )
+        
     else:
         res = Result(
             ok=False,

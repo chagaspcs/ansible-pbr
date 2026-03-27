@@ -1310,6 +1310,370 @@ def run_remote_sites(
         sites_failed=sites_failed,
     )
 
+# ---------------------------------
+# ROLLBACK
+# ---------------------------------
+
+def run_rollback(
+    *,
+    hv: Dict[str, Any],
+    gv: Dict[str, Any],
+    logs_dir: Path,
+    dry_run: bool,
+    username: str,
+    password: str,
+    host: str,
+) -> Result:
+    """
+    Rollback integral:
+      - centrais: remove policy/interface, route-map, ACLs, track, ip sla
+      - remotos: reordena route-map sbt apenas nas 3 primeiras prioridades:
+            prioridade 2 -> 1
+            prioridade 3 -> 2
+            prioridade 1 (10.115.87.x/10.115.88.x) -> 3
+        prioridades > 3 permanecem inalteradas
+    """
+
+    def _read_remote_sbt_sets(
+        conn: ConnectHandler,
+        route_map_name: str = "sbt",
+        seq: int = 10,
+    ) -> List[Dict[str, Any]]:
+        out_rm = _send_exec(
+            conn,
+            f"show run | section ^route-map {route_map_name}",
+            read_timeout=90,
+        )
+
+        lines = out_rm.splitlines()
+        in_target_seq = False
+        set_lines: List[Dict[str, Any]] = []
+
+        for line in lines:
+            stripped = line.strip()
+
+            if re.match(rf"^route-map {re.escape(route_map_name)} permit {seq}$", stripped):
+                in_target_seq = True
+                continue
+
+            if in_target_seq:
+                if stripped.startswith("route-map "):
+                    in_target_seq = False
+                    continue
+
+                m = re.search(
+                    r"^set ip next-hop verify-availability\s+"
+                    r"(\d+\.\d+\.\d+\.\d+)\s+"
+                    r"(\d+)\s+track\s+(\d+)$",
+                    stripped,
+                )
+                if m:
+                    set_lines.append(
+                        {
+                            "next_hop": m.group(1),
+                            "priority": int(m.group(2)),
+                            "track": int(m.group(3)),
+                            "raw": stripped,
+                        }
+                    )
+
+        return set_lines
+
+    def _build_remote_rollback_sbt_commands(
+        current_sets: List[Dict[str, Any]],
+        route_map_name: str = "sbt",
+        seq: int = 10,
+    ) -> List[str]:
+        """
+        Rollback remoto:
+        - altera somente as 3 primeiras prioridades
+        - prioridade 2 -> 1
+        - prioridade 3 -> 2
+        - prioridade 1 (10.115.87.x ou 10.115.88.x) -> 3
+        - prioridades > 3 permanecem inalteradas
+        """
+
+        if len(current_sets) < 3:
+            raise RuntimeError(
+                f"Expected at least 3 set lines in route-map {route_map_name} permit {seq}, got {len(current_sets)}"
+            )
+
+        ordered = sorted(current_sets, key=lambda x: x["priority"])
+
+        top3 = ordered[:3]
+        rest = ordered[3:]
+
+        p1 = top3[0]
+        p2 = top3[1]
+        p3 = top3[2]
+
+        if not (
+            p1["next_hop"].startswith("10.115.87.")
+            or p1["next_hop"].startswith("10.115.88.")
+        ):
+            raise RuntimeError(
+                f"Expected priority 1 to be 10.115.87.x/10.115.88.x, got {p1['next_hop']}"
+            )
+
+        rotated_top3 = [p2, p3, p1]
+
+        cmds: List[str] = [f"route-map {route_map_name} permit {seq}"]
+
+        # remove todas as linhas atuais
+        for item in ordered:
+            cmds.append(f" no {item['raw']}")
+
+        # recria top3 com prioridades 1/2/3
+        for idx, item in enumerate(rotated_top3, start=1):
+            cmds.append(
+                f" set ip next-hop verify-availability {item['next_hop']} {idx} track {item['track']}"
+            )
+
+        # recria o restante com as prioridades originais
+        for item in rest:
+            cmds.append(
+                f" set ip next-hop verify-availability {item['next_hop']} {item['priority']} track {item['track']}"
+            )
+
+        cmds.append("exit")
+        return cmds
+
+    route_map_name = hv.get("route_map_name", gv.get("route_map_name", "v200_to_s2s"))
+    apply_interfaces = hv.get("apply_interfaces", gv.get("apply_interfaces", ["GigabitEthernet0/0", "GigabitEthernet0/1"]))
+
+    remote_route_map = gv.get("remote_route_map", "sbt")
+    remote_route_map_seq = int(gv.get("remote_route_map_seq", 10))
+
+    blocks: List[Dict[str, Any]] = hv.get("blocks") or []
+    if not blocks:
+        return Result(
+            ok=False,
+            hostname="UNKNOWN",
+            where_failed="hostvars_schema",
+            details="Missing 'blocks' in hostvars",
+            sites_total=0,
+            sites_changed=0,
+            sites_skipped=0,
+            sites_failed=0,
+        )
+
+    hostname_last = "UNKNOWN"
+    summary: Dict[str, Any] = {"blocks": []}
+
+    sites_total = 0
+    sites_changed = 0
+    sites_skipped = 0
+    sites_failed = 0
+
+    # ---------------------------------
+    # 1) ROLLBACK NOS CENTRAIS
+    # ---------------------------------
+    central_base = _mklogbase(
+        logs_dir,
+        label=f"rollback_central_{hv.get('inventory_hostname', host)}",
+        ip=host,
+    )
+    conn_central = None
+
+    try:
+        conn_central = _connect_ios_telnet(
+            host,
+            username,
+            password,
+            timeout=30,
+            session_log=central_base.with_suffix(".session.log"),
+        )
+        hostname_last = _parse_hostname_from_prompt(conn_central.find_prompt())
+
+        central_cmds: List[str] = []
+        all_acl_tags: List[str] = []
+        all_sla_ids: List[int] = []
+        all_track_ids: List[int] = []
+
+        for block in blocks:
+            # remove policy das interfaces
+            for intf in apply_interfaces:
+                central_cmds += [
+                    f"interface {intf}",
+                    f" no ip policy route-map {route_map_name}",
+                    "exit",
+                ]
+
+            # ACL tags
+            acl_tags = block.get("acl_tags") or []
+            all_acl_tags.extend(acl_tags)
+
+            # SLA/track IDs derivados dos arubas
+            for aruba_ip in block.get("aruba_remoto", []):
+                sid = int(str(aruba_ip).split(".")[-1])
+                all_sla_ids.append(sid)
+                all_track_ids.append(sid)
+
+        # remove route-map
+        central_cmds.append(f"no route-map {route_map_name}")
+
+        # remove ACLs
+        for tag in sorted(set(all_acl_tags)):
+            central_cmds.append(f"no ip access-list extended {tag}")
+
+        # remove tracks
+        for tid in sorted(set(all_track_ids)):
+            central_cmds.append(f"no track {tid}")
+
+        # remove IP SLA schedules + IP SLA
+        for sid in sorted(set(all_sla_ids)):
+            central_cmds.append(f"no ip sla schedule {sid}")
+            central_cmds.append(f"no ip sla {sid}")
+
+        _write_text(central_base.with_suffix(".planned.cfg"), "\n".join(central_cmds) + "\n")
+
+        if not dry_run and central_cmds:
+            out_apply = _send_cfg(conn_central, central_cmds)
+            _write_text(central_base.with_suffix(".apply.txt"), out_apply)
+
+    except Exception as e:
+        _write_text(central_base.with_suffix(".error.txt"), str(e))
+        return Result(
+            ok=False,
+            hostname=hostname_last,
+            where_failed="central_rollback",
+            details=str(e),
+            sites_total=sites_total,
+            sites_changed=sites_changed,
+            sites_skipped=sites_skipped,
+            sites_failed=sites_failed,
+        )
+    finally:
+        _safe_disconnect(conn_central)
+
+    # ---------------------------------
+    # 2) ROLLBACK NOS REMOTOS
+    # ---------------------------------
+    for b_idx, block in enumerate(blocks):
+        block_name = block.get("name", f"block{b_idx+1}")
+        block_report = {"name": block_name, "sites": []}
+
+        rr_list = block.get("roteador_remoto", [])
+        for i, rr_ip in enumerate(rr_list):
+            sites_total += 1
+
+            site_report: Dict[str, Any] = {
+                "roteador_remoto": rr_ip,
+                "sw_local": block.get("sw_local"),
+                "sw_remoto": (block.get("sw_remoto") or [None] * len(rr_list))[i],
+                "mux_local": (block.get("mux_local") or [None] * len(rr_list))[i],
+                "mux_remoto": (block.get("mux_remoto") or [None] * len(rr_list))[i],
+            }
+
+            base = _mklogbase(logs_dir, label=f"rollback_remote_{block_name}_{rr_ip}", ip=rr_ip)
+            conn_r = None
+
+            try:
+                conn_r = _connect_ios_telnet(
+                    rr_ip,
+                    username,
+                    password,
+                    timeout=30,
+                    session_log=base.with_suffix(".session.log"),
+                )
+                hostname_last = _parse_hostname_from_prompt(conn_r.find_prompt())
+                site_report["hostname"] = hostname_last
+
+                current_sets = _read_remote_sbt_sets(
+                    conn_r,
+                    route_map_name=remote_route_map,
+                    seq=remote_route_map_seq,
+                )
+
+                ordered_before = sorted(current_sets, key=lambda x: x["priority"])
+                site_report["set_before"] = [x["raw"] for x in ordered_before]
+
+                cmds_r = _build_remote_rollback_sbt_commands(
+                    current_sets,
+                    route_map_name=remote_route_map,
+                    seq=remote_route_map_seq,
+                )
+
+                site_report["planned_commands"] = cmds_r
+                _write_text(base.with_suffix(".planned.cfg"), "\n".join(cmds_r) + "\n")
+
+                if dry_run:
+                    site_report["status"] = "dry_run_change_planned"
+                    block_report["sites"].append(site_report)
+                    _write_json(base.with_suffix(".result.json"), site_report)
+                    sites_changed += 1
+                    continue
+
+                out_apply = _send_cfg(conn_r, cmds_r)
+                _write_text(base.with_suffix(".apply.txt"), out_apply)
+
+                # sanity do remoto
+                out_after = _send_exec(
+                    conn_r,
+                    f"show run | section ^route-map {remote_route_map}",
+                    read_timeout=90,
+                )
+                _write_text(base.with_suffix(".after.txt"), out_after)
+
+                after_sets = _read_remote_sbt_sets(
+                    conn_r,
+                    route_map_name=remote_route_map,
+                    seq=remote_route_map_seq,
+                )
+                ordered_after = sorted(after_sets, key=lambda x: x["priority"])
+
+                if len(ordered_after) < 3:
+                    raise RuntimeError(f"Expected at least 3 set lines after rollback, got {len(ordered_after)}")
+
+                top3_after = ordered_after[:3]
+
+                if top3_after[0]["priority"] != 1 or top3_after[1]["priority"] != 2 or top3_after[2]["priority"] != 3:
+                    raise RuntimeError("Top3 priorities after rollback are not 1/2/3")
+
+                if not (
+                    top3_after[2]["next_hop"].startswith("10.115.87.")
+                    or top3_after[2]["next_hop"].startswith("10.115.88.")
+                ):
+                    raise RuntimeError(
+                        f"Expected priority 3 to be 10.115.87.x/10.115.88.x, got {top3_after[2]['next_hop']}"
+                    )
+
+                site_report["set_after"] = [x["raw"] for x in ordered_after]
+                site_report["status"] = "ok"
+
+                block_report["sites"].append(site_report)
+                _write_json(base.with_suffix(".result.json"), site_report)
+                sites_changed += 1
+
+            except Exception as e:
+                sites_failed += 1
+                site_report["status"] = "failed"
+                site_report["error"] = str(e)
+                block_report["sites"].append(site_report)
+                _write_json(base.with_suffix(".result.json"), site_report)
+
+            finally:
+                _safe_disconnect(conn_r)
+
+        summary["blocks"].append(block_report)
+
+    _write_json(logs_dir / f"rollback_summary_{_now_tag()}.json", summary)
+
+    return Result(
+        ok=(sites_failed == 0),
+        hostname=hostname_last,
+        where_failed=None if sites_failed == 0 else "rollback_remote_or_central",
+        details=None if sites_failed == 0 else "One or more rollback operations failed",
+        rollback_attempted=False,
+        rollback_ok=None,
+        planned_commands=None,
+        sites_total=sites_total,
+        sites_changed=sites_changed,
+        sites_skipped=sites_skipped,
+        sites_failed=sites_failed,
+    )
+
+
 # ----------------------------
 # Loading vars
 # ----------------------------
@@ -1328,7 +1692,7 @@ def _load_yaml_if_exists(path: Path) -> Dict[str, Any]:
 # ----------------------------
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", required=True, choices=["central_v200", "remote_sites"])
+    ap.add_argument("--mode", required=True, choices=["central_v200", "remote_sites", "rollback"])
     ap.add_argument("--host", required=True, help="Router management IP (ansible_host)")
     ap.add_argument("--username", required=True)
     ap.add_argument("--password", required=True)
@@ -1370,6 +1734,17 @@ def main() -> int:
             username=args.username,
             password=args.password,
         )
+    elif args.mode == "rollback":
+        res = run_rollback(
+            hv=hv,
+            gv=gv,
+            logs_dir=logs_dir,
+            dry_run=args.dry_run,
+            username=args.username,
+            password=args.password,
+            host=args.host,
+        )
+        
     else:
         res = Result(
             ok=False,
